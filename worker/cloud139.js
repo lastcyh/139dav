@@ -9,6 +9,7 @@
 //   GET /health                     状态
 //   GET /tree                       目录树摘要（WebDAV 账号密码）
 //   POST /admin/catalog             上传 catalog（管理口令）
+//   POST /admin/check               死链体检, 清理失效/空白分享（管理口令）
 //   GET /probe?link=id#pwd          分享探测（WebDAV 账号密码）
 //
 // 读(WebDAV/直链/探测)用 DAV_USER/DAV_PASS; 写(管理页/改配置/导入目录)用 ADMIN_PASS,
@@ -48,6 +49,8 @@ const REALM_ADMIN = "139dav-admin"; // 管理写操作的 realm; 与读分开, �
 const WARM_BATCH = 8;        // 每次定时预热处理的挂载数(只补缺; 免费版单次请求 50 子请求上限, 不宜调大)
 const WARM_CALL_BUDGET = 25; // 预热时 139 API 调用预算(免费版单次请求 50 子请求上限)
 const WARM_DAILY_CAP = 2000; // 每日预热调用上限(保护账号, 避免触发风控)
+const CHECK_BATCH = 6;        // 每次死链体检处理的挂载数(体检由管理页按钮或 GitHub Actions 触发)
+const CHECK_CALL_BUDGET = 20; // 每次体检的 139 调用预算(免费版单次请求 50 子请求上限)
 
 const MIME = {
   mp4: "video/mp4", m4v: "video/mp4", mkv: "video/x-matroska", ts: "video/mp2t",
@@ -705,7 +708,7 @@ async function handleApi(request, env, url, ctx) {
 
   // 写操作(导入/覆盖目录)走管理口令; 只读接口(直链/树/探测)走 WebDAV 口令。
   // 只读场景用 WebDAV 密码, 写操作要用管理口令, 两者分开。
-  const isWrite = path === "/admin/catalog" || path === "/admin/catalog-lines";
+  const isWrite = path === "/admin/catalog" || path === "/admin/catalog-lines" || path === "/admin/check";
   const authed = isWrite ? await checkAdminAuth(request, env) : await checkAuth(request, env);
   if (!authed) return unauthorized(isWrite ? REALM_ADMIN : REALM);
 
@@ -744,6 +747,15 @@ async function handleApi(request, env, url, ctx) {
     await env.CACHE.put("catalog", JSON.stringify(data));
     globalThis.__cat = null;
     return json({ ok: true, mounts: Object.keys(data.mounts).length, generated: data.generated || null });
+  }
+
+  if (path === "/admin/check" && request.method === "POST") {
+    // 死链体检: 前端拿着 nextFrom 反复调用, 直到 done 为止
+    let b = {};
+    try { b = await request.json(); } catch {}
+    const from = (b && typeof b.from === "string") ? b.from : "";
+    const r = await pruneCatalog(env, from, CHECK_BATCH);
+    return json({ ok: true, total: r.total, remaining: r.remaining, checked: r.checked, nextFrom: r.nextFrom, done: r.done, removed: r.removed });
   }
 
   if (path === "/probe") {
@@ -816,7 +828,7 @@ f.onsubmit = async (e) => {
 };
 </` + `script>`;
 
-const ADMIN_FORM = (origin, info, dav_user, dav_pass, lines, adminSet) => `
+const ADMIN_FORM = (origin, info, dav_user, dav_pass, lines, adminSet, checkLog) => `
 <h1>139dav 管理页</h1>
 <p class="sub">分享列表管理 · WebDAV 与直链接口同源</p>
 <div class="status">
@@ -824,12 +836,15 @@ WebDAV 地址: <b>` + xmlEsc(origin) + `/</b>，播放器/rclone 直接挂<br>
 WebDAV 账号: <b>` + xmlEsc(dav_user) + `</b>  密码: <b>` + xmlEsc(dav_pass) + `</b>，忘了就回这里看<br>
 直链接口: <b>` + xmlEsc(origin) + `/link?path=/分类/标题/文件.mp4</b><br>
 管理口令: <b>` + (adminSet ? "已启用，改目录、改配置要用它" : "未启用，当前用 WebDAV 密码管理") + `</b><br>
-当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载，generated ` + xmlEsc(info.generated || "未导入") + `
+当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载，generated ` + xmlEsc(info.generated || "未导入") + `<br>
+最近清理: <b>` + (checkLog && checkLog.length ? checkLog.slice(0, 5).map(x => x.path).join("、") + (checkLog.length > 5 ? " 等 " + checkLog.length + " 项" : "") : "无") + `</b>
 </div>
 <label>分享列表。每行一条：<code>分类/标题 | 分享链接或ID#提取码</code>，链接可多个用逗号分隔。保存是整份覆盖，已自动回填现有目录。路径不能含 <code>|</code>，提取码不能含逗号/分号。</label>
 <textarea id="cat" placeholder="分类/标题 | https://yun.139.com/shareweb/#/w/i/xxxxxx&#10;电影/某电影 | yyyyyyyy,zzzzzzzz#8888">` + xmlEsc(lines || "") + `</textarea>
 <button id="b1">保存目录 · 整份覆盖</button>
 <p class="hint" id="msg"></p>
+<button id="b3">检查链接 · 清理失效和空白分享</button>
+<p class="hint" id="msg3"></p>
 <p class="hint">大批量导入请用仓库里的 <b>clean_links.py</b>，把包含 139 分享链接的 Markdown 放进 data/ 自动清洗，再跑 <b>upload_catalog.py</b> 上传。</p>
 <details><summary>修改初始配置：Authorization / WebDAV 账号密码 / 管理口令</summary>
 <label>139 Authorization</label><textarea id="auth2"></textarea>
@@ -853,6 +868,32 @@ b1.onclick = async () => {
     ? ("已保存 " + j.mounts + " 个挂载" + (j.merged ? "；有 " + j.merged.length + " 个重复路径已自动合并：" + j.merged.join("、") : ""))
     : ("失败: " + (j.error || r.status));
   msg.className = j.ok ? "hint ok" : "hint err";
+};
+b3.onclick = async () => {
+  if (!confirm("会逐个探测所有分享，把失效和空白的链接从目录里删掉。挂载多时要等一会儿，继续？")) return;
+  b3.disabled = true;
+  let from = "", removed = [], total = 0, guard = 0, done = false;
+  try {
+    while (!done) {
+      if (++guard > 1000) break;
+      const r = await fetch("/admin/check", { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ from: from }) });
+      const j = await r.json().catch(() => ({}));
+      if (!j.ok) { msg3.textContent = "失败: " + (j.error || r.status); msg3.className = "hint err"; return; }
+      from = j.nextFrom; total = j.total; done = j.done;
+      if (j.removed && j.removed.length) removed = removed.concat(j.removed);
+      msg3.textContent = "体检中… 还剩 " + j.remaining + " 个，已清理 " + removed.length + " 项";
+      msg3.className = "hint";
+    }
+    msg3.textContent = removed.length
+      ? ("体检完成：共 " + total + " 个挂载，清理了 " + removed.length + " 项，稍后自动刷新")
+      : ("体检完成：共 " + total + " 个挂载，没有失效或空链接");
+    msg3.className = "hint ok";
+    if (removed.length) setTimeout(() => location.reload(), 2000);
+  } catch (e) {
+    msg3.textContent = "失败: " + e;
+    msg3.className = "hint err";
+  } finally { b3.disabled = false; }
 };
 b2.onclick = async () => {
   b2.disabled = true;
@@ -962,7 +1003,9 @@ async function handleAdminUi(request, env, url) {
   } catch {}
   const cfg = await getConfig(env);
   const adminSet = !!cfg.admin_pass;
-  return page("管理页", ADMIN_FORM(url.origin, info, cfg.dav_user || "-", cfg.dav_pass || "-", lines, adminSet));
+  let checkLog = [];
+  try { checkLog = JSON.parse(await env.CACHE.get("check_log")) || []; } catch {}
+  return page("管理页", ADMIN_FORM(url.origin, info, cfg.dav_user || "-", cfg.dav_pass || "-", lines, adminSet, checkLog));
 }
 
 async function handleCatalogLines(request, env) {
@@ -1034,9 +1077,79 @@ async function warmMounts(env, ctx) {
   }
 }
 
+// ================= 死链体检 =================
+
+// 探测一个挂载成员(现拉根目录, 不走缓存)。四种结果:
+//   ok      能列出且有内容
+//   empty   能列出但里面什么都没有
+//   dead    139 明确报错(分享被取消 / 提取码错)。要连错两次才算, 免得偶发业务错误误删
+//   unknown 风控 9530 / 网络错误 / 预算用尽这类临时问题, 一律保留, 绝不当死链删
+async function probeMember(env, member, budget) {
+  let last = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await listAll(env, member, "root", budget);
+      return (!r.folders.length && !r.files.length) ? { status: "empty" } : { status: "ok" };
+    } catch (e) {
+      const rc = String(e?.rc ?? "ERR");
+      const msg = String(e?.message || e).slice(0, 120);
+      if (rc === "9530" || rc === "ERR" || rc === "BUDGET") return { status: "unknown", rc, msg };
+      last = { rc, msg };
+    }
+  }
+  return { status: "dead", rc: last?.rc || "?", msg: last?.msg || "" };
+}
+
+// 体检并清理: 从 from 指定的那个挂载开始, 处理最多 batch 个, 失效/空白的成员直接从 catalog 移除。
+// 一个挂载绑多条分享时只移除挂掉的那几条, 全挂才移除整个挂载。
+// 游标用"路径"而不是下标 —— 清理会把后面的挂载往前挪, 用下标会跳着漏查。
+async function pruneCatalog(env, from, batch) {
+  const cat = await getCatalog(env);
+  const mounts = cat.mounts || {};
+  const keys = Object.keys(mounts);
+  if (!keys.length) return { total: 0, remaining: 0, checked: 0, nextFrom: "", done: true, removed: [] };
+  let i = 0;
+  if (from) { const at = keys.indexOf(from); i = at >= 0 ? at : 0; }
+  const budget = (globalThis.__callCount || 0) + CHECK_CALL_BUDGET;
+  const next = { ...mounts };
+  const removed = [];
+  let n = 0;
+  while (i < keys.length && n < batch) {
+    if ((globalThis.__callCount || 0) >= budget) break;   // 预算用尽, 剩下的下一轮再查
+    const path = keys[i];
+    const members = parseMembers(mounts[path]);
+    n++; i++;
+    if (!members.length) { delete next[path]; removed.push({ path, reason: "挂载为空" }); continue; }
+    const kept = [], why = [];
+    for (const m of members) {
+      const r = await probeMember(env, m, budget);
+      if (r.status === "ok" || r.status === "unknown") kept.push(m);
+      else why.push(m.id + ": " + (r.status === "empty" ? "空分享" : (r.rc || "失效")));
+    }
+    if (!kept.length) { delete next[path]; removed.push({ path, reason: why.join("; ") || "全部失效" }); }
+    else if (kept.length < members.length) {
+      next[path] = { id: kept.map(m => (m.pwd ? m.id + "#" + m.pwd : m.id)).join(",") };
+      removed.push({ path, reason: "部分成员失效: " + why.join("; ") });
+    }
+  }
+  const done = i >= keys.length;
+  if (removed.length) {
+    // generated 也跟着更新, 让客户端知道目录变过
+    const generated = new Date(Date.now() + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00");
+    await env.CACHE.put("catalog", JSON.stringify({ ...cat, generated, mounts: next }));
+    globalThis.__cat = null;
+    let log = [];
+    try { log = JSON.parse(await env.CACHE.get("check_log")) || []; } catch {}
+    log = removed.map(r => ({ path: r.path, reason: r.reason, t: Date.now() })).concat(log).slice(0, 30);
+    await env.CACHE.put("check_log", JSON.stringify(log), { expirationTtl: 30 * 86400 });
+  }
+  // 下一轮从 keys[i] 接着查。keys[i] 这一项一定还在(只删过 i 之前的), 所以游标不会丢。
+  return { total: keys.length, remaining: keys.length - i, checked: n, nextFrom: done ? "" : keys[i], done, removed };
+}
+
 // 入口
 // 注: /admin 与 /setup 在 fetch 里已提前分流, 不放进这个集合
-const API_PATHS = new Set(["/health", "/tree", "/admin/catalog", "/admin/catalog-lines", "/probe"]);
+const API_PATHS = new Set(["/health", "/tree", "/admin/catalog", "/admin/catalog-lines", "/admin/check", "/probe"]);
 
 export default {
   async fetch(request, env, ctx) {
@@ -1055,6 +1168,8 @@ export default {
     }
   },
   async scheduled(event, env, ctx) {
+    // 定时任务只负责预热缓存。死链体检不在这里做:
+    // 用 GitHub Actions 的由 workflow 每天调 /admin/check; 只用管理页的手动点按钮。
     try { await warmMounts(env, ctx); } catch (e) { console.log("warm 失败:", String(e).slice(0, 150)); }
   },
 };
