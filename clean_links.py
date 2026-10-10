@@ -104,14 +104,19 @@ def iter_lines(path):
         for p in docx.Document(path).paragraphs:
             yield p.text
     else:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                yield line.rstrip("\n")
+        raw = open(path, "rb").read()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            # 网上扒下来的老文档常见 GBK/GB18030, 别直接崩
+            text = raw.decode("gb18030", errors="replace")
+        for line in text.splitlines():
+            yield line
 
 
 def parse_file(path):
     """返回按文档顺序的 {路径段, 标题, 链接ID列表} 列表（按分享 ID 在本文件内去重）"""
-    items, seen = [], set()
+    items, seen = [], {}   # 分享ID -> 提取码(""): 去重先到先得, 但"无提取码"可被"带提取码"升级
     headings = []   # [(级别, 标题)] —— 用栈处理跳级标题
     for line in iter_lines(path):
         h = re.match(r"^(#{1,6})\s+(.*)", line)
@@ -123,10 +128,22 @@ def parse_file(path):
         ids = [i for i in extract_ids(line) if not DEMO_RE.match(i)]
         if not ids:
             continue
-        new_ids = [i for i in ids if i.split("#")[0] not in seen]
+        new_ids = []
+        for i in ids:
+            sid, _, pwd = i.partition("#")
+            if sid not in seen:
+                seen[sid] = pwd
+                new_ids.append(i)
+            elif pwd and not seen[sid]:
+                # 同一分享先以"裸 ID"登记过、这行带提取码: 升级旧条目,
+                # 否则去重会静默丢掉提取码, 生成一个需要提取码却拿不到的失效挂载
+                seen[sid] = pwd
+                for it in items:
+                    for k, old in enumerate(it["ids"]):
+                        if old.split("#")[0] == sid:
+                            it["ids"][k] = i
         if not new_ids:
             continue
-        seen.update(i.split("#")[0] for i in new_ids)
         raw = re.sub(r"https?://\S+", "", line)
         raw = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", raw).strip()
         title = clean_title(re.sub(r"^\d+[.、]\s*", "", raw)) or new_ids[0]

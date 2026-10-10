@@ -24,7 +24,6 @@ from Crypto.Cipher import AES
 
 AES_KEY = b"PVGDwmcvfs1uV3d1"          # OpenList 139 驱动内置的分享接口密钥
 LIST_URL = "https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/getOutLinkInfoV6"
-INFO_URL = "https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/getContentInfoFromOutLink"
 DL_URL = "https://share-kd-njs.yun.139.com/yun-share/richlifeApp/devapp/IOutLink/dlFromOutLinkV3"
 
 HEADERS = {
