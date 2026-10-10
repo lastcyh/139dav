@@ -35,6 +35,9 @@ URL_PATTERNS = [
     re.compile(r"yun\.139\.com/w/#/share/([0-9A-Za-z]+)"),
     re.compile(r"caiyun\.139\.com/[wm]/i[/?]([0-9A-Za-z]+)"),
 ]
+# 文档里只写裸 ID / ID#提取码（没写完整链接）时的识别式。
+# 长度 >= 8，避免把散文里的普通词、集数（如 S01E01）误当成分享 ID 挂上去。
+BARE_TOKEN_RE = re.compile(r"^[0-9A-Za-z]{8,40}(?:#[^\s,，;；)\]]{1,32})?$")
 YEAR_RE = re.compile(r"[（(](\d{4})[）)]")
 # 画质 / 集数等噪音。只删掉词本身、保留其余内容，
 # 否则「4K修复版 某电影」这种前缀会被整条清空
@@ -70,6 +73,21 @@ def extract_ids(line):
                 if cand and len(cand) <= 32 and not re.search(r"[/:?]", cand):
                     pwd = cand
             out.append(f"{sid}#{pwd}" if pwd else sid)
+    if out:
+        return out
+    # 没写完整链接时，才尝试裸 ID / ID#提取码。
+    # 只认"最后一个分隔符(: ： |)右边"且整段都是纯 ID 的写法 —— 否则散文里的普通词
+    # 会被误当成分享 ID，生成一堆加载不了的假挂载。
+    tail = re.split(r"[:：|]", line)[-1].strip()
+    toks = [t for t in re.split(r"[,，;；\s]+", tail) if t]
+    if not toks or not all(BARE_TOKEN_RE.match(t) for t in toks):
+        return out
+    for t in toks:
+        sid = t.split("#")[0]
+        if sid in seen:
+            continue
+        seen.add(sid)
+        out.append(t)
     return out
 
 
@@ -145,6 +163,10 @@ def parse_file(path):
         if not new_ids:
             continue
         raw = re.sub(r"https?://\S+", "", line)
+        if not re.search(r"https?://", line):
+            # 裸 ID 行: 把 ID 从标题文本里去掉, 否则标题会变成那串 ID
+            for i in ids:
+                raw = raw.replace(i, "")
         raw = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", raw).strip()
         title = clean_title(re.sub(r"^\d+[.、]\s*", "", raw)) or new_ids[0]
         items.append({"path": [t for _, t in headings], "title": title, "ids": new_ids})

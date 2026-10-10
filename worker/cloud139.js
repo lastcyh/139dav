@@ -571,6 +571,12 @@ async function handleDav(request, env, url, ctx) {
 
   if (request.method === "PROPFIND") {
     const depth = (request.headers.get("Depth") || "1").trim();
+    // Depth: infinity 表示"递归整棵树"。本库做不到(要递归打几百次 139 接口, 会撞免费版
+    // 50 子请求上限), 以前是当 Depth:1 处理 —— 客户端以为拿全了其实只有一层, 更坑。
+    // RFC 4918 允许用 403 明确拒绝, 这里就明确拒绝。
+    if (/^infinity$/i.test(depth)) {
+      return text("403 Forbidden: 不支持 Depth: infinity, 目录树太大, 请改用 Depth: 1", 403);
+    }
     const cat = await getCatalog(env);
     let resolved;
     try { resolved = await resolvePath(env, buildTree(cat), segs, ctx); }
@@ -619,7 +625,9 @@ async function handleDav(request, env, url, ctx) {
   }
 
   if (request.method === "PROPPATCH" || request.method === "LOCK" || request.method === "UNLOCK") {
-    return new Response(null, { status: 200 }); // 只读库, 空应答让客户端继续
+    // 只读库: 这三个方法一律不支持。以前返回空 200 假装成功, 客户端会以为
+    // 属性写成功 / 拿到锁, 行为不可预期; 现在按 OPTIONS 里 Allow 的实际能力回 405。
+    return text("405 Method Not Allowed: 只读库, 不支持改属性/加锁", 405);
   }
   return text("405 Method Not Allowed", 405);
 }
@@ -696,7 +704,7 @@ async function handleApi(request, env, url, ctx) {
   }
 
   // 写操作(导入/覆盖目录)走管理口令; 只读接口(直链/树/探测)走 WebDAV 口令。
-  // 这样把 WebDAV 账号给播放器/家人, 对方也改不了目录。
+  // 只读场景用 WebDAV 密码, 写操作要用管理口令, 两者分开。
   const isWrite = path === "/admin/catalog" || path === "/admin/catalog-lines";
   const authed = isWrite ? await checkAdminAuth(request, env) : await checkAuth(request, env);
   if (!authed) return unauthorized(isWrite ? REALM_ADMIN : REALM);
@@ -782,15 +790,16 @@ const SETUP_FORM = (notice, adminSet) => `
 <p class="sub">粘贴移动云盘网页版的 Authorization, 设好 WebDAV 账号密码, 即可完成部署</p>
 ` + (notice || "") + `
 <form id="f">
-<label>139 Authorization（yun.139.com 网页端 F12 → 网络 → hcy/file/list → 请求标头 Authorization, 可带或不带 Basic 前缀）</label>
+<label>139 Authorization</label>
+<p class="hint">yun.139.com 网页端 F12 → 网络 → hcy/file/list → 请求标头 Authorization，可带或不带 Basic 前缀</p>
 <textarea id="auth" placeholder="粘贴 Basic 后面的整串 base64" required></textarea>
-<label>139 账号（手机号, 一般会自动识别, 识别不出再手动填）</label>
+<label>139 账号，手机号。一般会自动识别，识别不出再手动填</label>
 <input id="account" placeholder="自动识别" inputmode="numeric">
 <label>WebDAV 用户名</label>
 <input id="dav_user" value="admin" required>
-<label>WebDAV 密码（至少 6 位）</label>
+<label>WebDAV 密码，至少 6 位</label>
 <input id="dav_pass" type="password" required>
-<label>管理口令（可选, 至少 6 位。填了之后改目录/改配置要用它; 留空 = 直接用 WebDAV 密码管理${adminSet ? "; 当前已设置, 留空 = 不修改" : ""}）</label>
+<label>管理口令，可选，至少 6 位。填了之后改目录、改配置要用它；留空就直接用 WebDAV 密码管理${adminSet ? "。当前已设置，留空则不修改" : ""}</label>
 <input id="admin_pass" type="password" autocomplete="new-password">
 <button>保存并完成部署</button>
 <p class="hint">保存后访问 <a href="/admin">/admin</a> 添加分享, 或用仓库里的 clean_links.py 批量导入。WebDAV 地址即本站根路径。</p>
@@ -811,24 +820,24 @@ const ADMIN_FORM = (origin, info, dav_user, dav_pass, lines, adminSet) => `
 <h1>139dav 管理页</h1>
 <p class="sub">分享列表管理 · WebDAV 与直链接口同源</p>
 <div class="status">
-WebDAV 地址: <b>` + xmlEsc(origin) + `/</b>（播放器/rclone 直接挂）<br>
-WebDAV 账号: <b>` + xmlEsc(dav_user) + `</b>  密码: <b>` + xmlEsc(dav_pass) + `</b>（忘了就回这里看）<br>
+WebDAV 地址: <b>` + xmlEsc(origin) + `/</b>，播放器/rclone 直接挂<br>
+WebDAV 账号: <b>` + xmlEsc(dav_user) + `</b>  密码: <b>` + xmlEsc(dav_pass) + `</b>，忘了就回这里看<br>
 直链接口: <b>` + xmlEsc(origin) + `/link?path=/分类/标题/文件.mp4</b><br>
-管理口令: <b>` + (adminSet ? "已启用（改目录/改配置要用它）" : "未启用（当前用 WebDAV 密码管理）") + `</b><br>
-当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载（generated ` + xmlEsc(info.generated || "未导入") + `）
+管理口令: <b>` + (adminSet ? "已启用，改目录、改配置要用它" : "未启用，当前用 WebDAV 密码管理") + `</b><br>
+当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载，generated ` + xmlEsc(info.generated || "未导入") + `
 </div>
-<label>分享列表（每行一条: <code>分类/标题 | 分享链接或ID#提取码</code>, 链接可多个用逗号分隔; 保存后全量覆盖。已自动回填现有目录; 路径不能含 <code>|</code>, 提取码不能含逗号/分号）</label>
+<label>分享列表。每行一条：<code>分类/标题 | 分享链接或ID#提取码</code>，链接可多个用逗号分隔。保存是整份覆盖，已自动回填现有目录。路径不能含 <code>|</code>，提取码不能含逗号/分号。</label>
 <textarea id="cat" placeholder="分类/标题 | https://yun.139.com/shareweb/#/w/i/xxxxxx&#10;电影/某电影 | yyyyyyyy,zzzzzzzz#8888">` + xmlEsc(lines || "") + `</textarea>
-<button id="b1">保存目录（全量覆盖）</button>
+<button id="b1">保存目录 · 整份覆盖</button>
 <p class="hint" id="msg"></p>
-<p class="hint">大批量导入请用仓库里的 <b>clean_links.py</b>（把包含 139 分享链接的 Markdown 放进 data/ 自动清洗）+ <b>upload_catalog.py</b>。</p>
-<details><summary>修改初始配置（Authorization / WebDAV 账号密码 / 管理口令）</summary>
+<p class="hint">大批量导入请用仓库里的 <b>clean_links.py</b>，把包含 139 分享链接的 Markdown 放进 data/ 自动清洗，再跑 <b>upload_catalog.py</b> 上传。</p>
+<details><summary>修改初始配置：Authorization / WebDAV 账号密码 / 管理口令</summary>
 <label>139 Authorization</label><textarea id="auth2"></textarea>
 <label>139 账号</label><input id="account2">
 <label>WebDAV 用户名</label><input id="dav_user2">
-<label>WebDAV 密码（留空 = 不修改）</label><input id="dav_pass2" type="password">
-<label>管理口令（留空 = 不修改${adminSet ? "" : "; 当前未启用"}）</label><input id="admin_pass2" type="password" autocomplete="new-password">
-<label style="font-weight:normal"><input type="checkbox" id="admin_clear" style="width:auto"> 清除管理口令（改回用 WebDAV 密码管理）</label>
+<label>WebDAV 密码，留空则不修改</label><input id="dav_pass2" type="password">
+<label>管理口令，留空则不修改${adminSet ? "" : "。当前未启用"}</label><input id="admin_pass2" type="password" autocomplete="new-password">
+<label style="font-weight:normal"><input type="checkbox" id="admin_clear" style="width:auto"> 清除管理口令，改回用 WebDAV 密码管理</label>
 <button id="b2">更新配置</button><p class="hint" id="msg2"></p>
 </details>
 <script>
@@ -839,8 +848,10 @@ b1.onclick = async () => {
   const r = await fetch("/admin/catalog-lines", { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ lines: cat.value }) });
   const j = await r.json().catch(() => ({}));
-  b1.disabled = false; b1.textContent = "保存目录（全量覆盖）";
-  msg.textContent = j.ok ? ("已保存 " + j.mounts + " 个挂载") : ("失败: " + (j.error || r.status));
+  b1.disabled = false; b1.textContent = "保存目录 · 整份覆盖";
+  msg.textContent = j.ok
+    ? ("已保存 " + j.mounts + " 个挂载" + (j.merged ? "；有 " + j.merged.length + " 个重复路径已自动合并：" + j.merged.join("、") : ""))
+    : ("失败: " + (j.error || r.status));
   msg.className = j.ok ? "hint ok" : "hint err";
 };
 b2.onclick = async () => {
@@ -849,7 +860,7 @@ b2.onclick = async () => {
     body: JSON.stringify({ auth: auth2.value.trim(), account: account2.value.trim(), dav_user: dav_user2.value.trim(), dav_pass: dav_pass2.value, admin_pass: admin_pass2.value, admin_clear: admin_clear.checked }) });
   const j = await r.json().catch(() => ({}));
   b2.disabled = false;
-  msg2.textContent = j.ok ? "已更新（管理口令变更后, 刷新页面会要求重新登录）" : ("失败: " + (j.error || r.status));
+  msg2.textContent = j.ok ? "已更新。管理口令变更后，刷新页面会要求重新登录" : ("失败: " + (j.error || r.status));
   msg2.className = j.ok ? "hint ok" : "hint err";
 };
 </` + `script>`;
@@ -882,7 +893,7 @@ async function handleSetup(request, env, url) {
   if (request.method === "GET") {
     // 已配置后, 打开/提交配置页属于"管理写操作", 用管理口令
     if (configured && !(await checkAdminAuth(request, env))) {
-      return new Response("401 Unauthorized（已配置, 修改请用管理口令登录）", {
+      return new Response("401 Unauthorized: 已配置, 修改请用管理口令登录", {
         status: 401, headers: { "WWW-Authenticate": `Basic realm="${REALM_ADMIN}"`, "Content-Type": "text/plain" } });
     }
     const c = configured ? await getConfig(env) : {};
@@ -961,6 +972,7 @@ async function handleCatalogLines(request, env) {
   let b;
   try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
   const mounts = {};
+  const merged = [];
   for (const line of String(b.lines || "").split("\n")) {
     const segs = line.split("|");
     if (segs.length < 2) continue;
@@ -969,6 +981,14 @@ async function handleCatalogLines(request, env) {
     if (!path || !link) continue;
     const ids = parseLinkEntriesInWorker(link);
     if (!ids.length) continue;
+    if (mounts[path]) {
+      // 同一路径写了两行: 合并 id, 而不是让后一行静默覆盖前一行(前者会被无声丢掉)
+      const have = new Set(mounts[path].id.split(",").map(s => s.split("#")[0]));
+      const add = ids.filter(i => !have.has(i.split("#")[0]));
+      if (add.length) mounts[path].id = [mounts[path].id].concat(add).join(",");
+      merged.push(path);
+      continue;
+    }
     mounts[path] = { id: ids.join(",") };
   }
   if (!Object.keys(mounts).length) return json({ error: "没有解析到有效条目, 格式: 路径 | 链接" }, 400);
@@ -979,7 +999,8 @@ async function handleCatalogLines(request, env) {
   const catalog = { version: 1, generated: generated, mounts: mounts };
   await env.CACHE.put("catalog", JSON.stringify(catalog));
   globalThis.__cat = null;
-  return json({ ok: true, mounts: Object.keys(mounts).length });
+  const uniqMerged = [...new Set(merged)];
+  return json({ ok: true, mounts: Object.keys(mounts).length, merged: uniqMerged.length ? uniqMerged : undefined });
 }
 
 // 定时预热: 每次处理一批挂载根目录, 让"点进文件夹"永远是热路径
