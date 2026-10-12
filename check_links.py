@@ -41,7 +41,7 @@ def main():
     if not url:
         return fail("缺少 --url（或环境变量 WORKER_URL）")
     if not args.user or not (args.admin_token or args.dav_pass):
-        return fail("缺少 --user / --pass（或环境变量 DAV_USER / DAV_PASS）")
+        return fail("缺少 --user 以及 --pass / --admin-token（或环境变量 DAV_USER / DAV_PASS / ADMIN_TOKEN）")
     if not url.startswith("http"):
         url = "https://" + url
     # 体检是写操作: Worker 设了管理口令就得用它, 没设才退回 WebDAV 密码
@@ -51,7 +51,7 @@ def main():
     token = base64.b64encode(f"{args.user}:{admin_token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
-    frm, removed, total = "", [], 0
+    frm, removed, flagged, total = "", [], [], 0
     for _ in range(args.max_rounds):
         try:
             r = requests.post(target, json={"from": frm}, headers=headers, timeout=60)
@@ -70,7 +70,12 @@ def main():
             return fail(f"体检失败: {j.get('error') or r.status_code}")
 
         total = j.get("total", 0)
-        removed += j.get("removed") or []
+        rem = j.get("removed")
+        if isinstance(rem, list):
+            removed += rem
+        flg = j.get("flagged")
+        if isinstance(flg, list):
+            flagged += flg
         frm = j.get("nextFrom") or ""
         if j.get("done") or not frm:
             break
@@ -79,7 +84,11 @@ def main():
 
     print(f"体检完成：共 {total} 个挂载，清理 {len(removed)} 项")
     for x in removed:
-        print(f"  - {x.get('path')}  {x.get('reason') or ''}")
+        print(f"  - {x.get('path')}  {x.get('reason') or ''}  原分享ID: {x.get('id') or '-'}")
+    if flagged:
+        print(f"\n另有 {len(flagged)} 个分享返回了未知错误码，已保留未删除，请自行判断：")
+        for x in flagged:
+            print(f"  - {x.get('path')}  {x.get('reason') or ''}")
     return 0
 
 

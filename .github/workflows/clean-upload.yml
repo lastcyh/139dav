@@ -43,8 +43,8 @@ jobs:
       # data/ 里没有有效链接时 clean_links.py 不会生成 catalog.json，
       # 这里跳过上传，避免拿空目录 / 示例数据覆盖线上真实目录
       - name: 上传 catalog 到 Worker
-        if: (steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') && hashFiles('catalog.json') != ''
-        run: python upload_catalog.py --url "$WORKER_URL" --user "$DAV_USER" --pass "$DAV_PASS" --admin-token "$ADMIN_TOKEN"
+        if: env.WORKER_URL != '' && (steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') && hashFiles('catalog.json') != ''
+        run: python upload_catalog.py
 
       - name: 记录本次 data/ 指纹
         if: steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
@@ -62,4 +62,4 @@ jobs:
       # 没配 Worker 地址就跳过，免得没配置的 fork 每天报红
       - name: 死链体检
         if: ${{ env.WORKER_URL != '' }}
-        run: python check_links.py --url "$WORKER_URL" --user "$DAV_USER" --pass "$DAV_PASS" --admin-token "$ADMIN_TOKEN"
+        run: python check_links.py

@@ -39,8 +39,8 @@ def main():
     url = (args.url or "").strip().rstrip("/")
     if not url:
         return fail("缺少 --url（或环境变量 WORKER_URL）")
-    if not args.user or not args.dav_pass:
-        return fail("缺少 --user / --pass（或环境变量 DAV_USER / DAV_PASS）")
+    if not args.user or not (args.admin_token or args.dav_pass):
+        return fail("缺少 --user 以及 --pass / --admin-token（或环境变量 DAV_USER / DAV_PASS / ADMIN_TOKEN）")
     # 上传是"写操作": Worker 设了管理口令就得用它, 没设才退回 WebDAV 密码
     admin_token = args.admin_token or args.dav_pass
     if not url.startswith("http"):

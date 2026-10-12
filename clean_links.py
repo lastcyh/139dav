@@ -6,8 +6,8 @@
   - "# / ## / ###" 标题行 -> 目录层级
   - 普通行: 行内文字清理后作为标题, 行内所有 139 链接绑定到该挂载
   - 标题自动去掉画质 / 集数等噪音
-  - 每个文档内按分享 ID 去重；同一分享要挂到多个目录时，在文档里写成多行
-    （跨文件不去重，所以放两个文件里会得到两个挂载）
+  - 每个文档内按分享 ID 去重（无提取码可被后出现的带提取码升级）
+  - 跨文件不去重：同一分享要挂到多个目录时，分别放进不同文档即可
 
 用法:
     python clean_links.py                # 处理 data/ 下所有 .md / .txt / .docx
@@ -122,7 +122,8 @@ def iter_lines(path):
         for p in docx.Document(path).paragraphs:
             yield p.text
     else:
-        raw = open(path, "rb").read()
+        with open(path, "rb") as f:
+            raw = f.read()
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:

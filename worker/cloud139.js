@@ -119,7 +119,7 @@ async function isConfigured(env) {
 }
 
 function parseMembers(leaf) {
-  return String(leaf.id || "").split(/[,，;；\n]+/).map(s => s.trim()).filter(Boolean).map(s => {
+  return String(leaf?.id || "").split(/[,，;；\n]+/).map(s => s.trim()).filter(Boolean).map(s => {
     const i = s.indexOf("#");
     return i >= 0 ? { id: s.slice(0, i), pwd: s.slice(i + 1) } : { id: s, pwd: "" };
   });
@@ -185,12 +185,13 @@ async function getAuth(env) {
   if (remain > 15 * 86400e3 || remain <= 0) return memo(); // 剩余>15天才续, 过期了续不了
   try {
     const dec = atob(auth);
-    const account = dec.split(":")[1];
-    const tok = dec.split(":")[2];
+    const parts = dec.split(":");
+    const account = parts[1] || "";
+    const tok = parts.slice(2).join(":");
     const r = await fetch(API.REFRESH, {
       method: "POST",
       headers: { "Content-Type": "application/xml" },
-      body: `<root><token>${tok}</token><account>${account}</account><clienttype>656</clienttype></root>`,
+      body: `<root><token>${xmlEsc(tok)}</token><account>${xmlEsc(account)}</account><clienttype>656</clienttype></root>`,
     });
     const xml = await r.text();
     const ret = (xml.match(/<return>([^<]*)<\/return>/i) || [])[1];
@@ -341,11 +342,23 @@ async function cachedListing(env, key, recompute, ctx, opts = {}) {
 // 而 resolvePath 按名字查找只认文件夹, 同名文件永远访问不到。
 function uniqueNames(folders, files) {
   const used = new Set();
-  for (const arr of [folders, files]) for (const e of arr) {
-    let name = e.name, n = 2;
-    while (used.has(name)) name = `${e.name} (${n++})`;
-    used.add(name);
-    e.name = name;
+  for (const arr of [folders, files]) {
+    const isFile = (arr === files);
+    for (const e of arr) {
+      let name = e.name, n = 2;
+      if (used.has(name)) {
+        if (isFile) {
+          const idx = e.name.lastIndexOf(".");
+          const base = (idx > 0) ? e.name.slice(0, idx) : e.name;
+          const ext = (idx > 0) ? e.name.slice(idx) : "";
+          while (used.has(name)) name = `${base} (${n++})${ext}`;
+        } else {
+          while (used.has(name)) name = `${e.name} (${n++})`;
+        }
+      }
+      used.add(name);
+      e.name = name;
+    }
   }
 }
 
@@ -443,7 +456,7 @@ async function listMountRoot(env, members, ctx, opts = {}) {
 }
 
 async function getDlUrl(env, members, entry) {
-  const member = members[entry.memberIdx || 0];
+  const member = (members && (members[entry.memberIdx || 0] || members[0])) || { id: "", pwd: "" };
   const account = (await getConfig(env)).account;
   // 缓存键带上账号和提取码指纹: 否则换 139 账号、或同一分享改了提取码后,
   // 10 分钟内还会复用旧直链
@@ -520,7 +533,7 @@ async function dirEntries(env, resolved, ctx, cat) {
   }
   const lst = resolved.kind === "mountdir"
     ? await listMountRoot(env, resolved.members, ctx)
-    : await listOne(env, resolved.members[resolved.entry.memberIdx || 0], resolved.entry.id, ctx);
+    : await listOne(env, (resolved.members && (resolved.members[resolved.entry.memberIdx || 0] || resolved.members[0])) || { id: "", pwd: "" }, resolved.entry.id, ctx);
   return lst.folders.concat(lst.files);
 }
 
@@ -531,10 +544,11 @@ const hrefOf = segs => "/" + segs.map(s => encodeURIComponent(s)).join("/");
 
 function davResponse(href, e, isRoot) {
   const isDir = e.kind === "dir" || isRoot;
+  const finalHref = (isDir && !href.endsWith("/")) ? href + "/" : href;
   const mtime = e.mtime ? new Date(e.mtime) : new Date(0);
   const mime = isDir ? "httpd/unix-directory" : (MIME[e.name.split(".").pop().toLowerCase()] || "application/octet-stream");
   return `<D:response>
-<D:href>${xmlEsc(href)}</D:href>
+<D:href>${xmlEsc(finalHref)}</D:href>
 <D:propstat><D:prop>
 <D:displayname>${xmlEsc(e.name || "")}</D:displayname>
 <D:resourcetype>${isDir ? "<D:collection/>" : ""}</D:resourcetype>
@@ -669,9 +683,10 @@ async function authCheck(request, env, mode) {
   if (!wantUser || !wantPass) return false;
   const h = request.headers.get("Authorization") || "";
   let ok = false;
-  if (h.startsWith("Basic ")) {
+  const basicMatch = h.match(/^Basic\s+(.+)$/i);
+  if (basicMatch) {
     let bin = null;
-    try { bin = atob(h.slice(5)); } catch {}
+    try { bin = atob(basicMatch[1].trim()); } catch {}
     if (bin !== null) {
       // 客户端发的可能是 UTF-8 字节, atob 出来是 latin1 字符串, 中文账号密码会比对失败;
       // 两种解释都试一下(纯 ASCII 时两者相同)
@@ -755,7 +770,7 @@ async function handleApi(request, env, url, ctx) {
     try { b = await request.json(); } catch {}
     const from = (b && typeof b.from === "string") ? b.from : "";
     const r = await pruneCatalog(env, from, CHECK_BATCH);
-    return json({ ok: true, total: r.total, remaining: r.remaining, checked: r.checked, nextFrom: r.nextFrom, done: r.done, removed: r.removed });
+    return json({ ok: true, total: r.total, remaining: r.remaining, checked: r.checked, nextFrom: r.nextFrom, done: r.done, removed: r.removed, flagged: r.flagged });
   }
 
   if (path === "/probe") {
@@ -837,7 +852,7 @@ WebDAV 账号: <b>` + xmlEsc(dav_user) + `</b>  密码: <b>` + xmlEsc(dav_pass) 
 直链接口: <b>` + xmlEsc(origin) + `/link?path=/分类/标题/文件.mp4</b><br>
 管理口令: <b>` + (adminSet ? "已启用，改目录、改配置要用它" : "未启用，当前用 WebDAV 密码管理") + `</b><br>
 当前目录: <b>` + xmlEsc(String(info.mounts)) + `</b> 个挂载，generated ` + xmlEsc(info.generated || "未导入") + `<br>
-最近清理: <b>` + (checkLog && checkLog.length ? checkLog.slice(0, 5).map(x => x.path).join("、") + (checkLog.length > 5 ? " 等 " + checkLog.length + " 项" : "") : "无") + `</b>
+最近清理: <b>` + (checkLog && checkLog.length ? checkLog.slice(0, 5).map(x => xmlEsc(x.path)).join("、") + (checkLog.length > 5 ? " 等 " + checkLog.length + " 项" : "") : "无") + `</b>
 </div>
 <label>分享列表。每行一条：<code>分类/标题 | 分享链接或ID#提取码</code>，链接可多个用逗号分隔。保存是整份覆盖，已自动回填现有目录。路径不能含 <code>|</code>，提取码不能含逗号/分号。</label>
 <textarea id="cat" placeholder="分类/标题 | https://yun.139.com/shareweb/#/w/i/xxxxxx&#10;电影/某电影 | yyyyyyyy,zzzzzzzz#8888">` + xmlEsc(lines || "") + `</textarea>
@@ -872,7 +887,7 @@ b1.onclick = async () => {
 b3.onclick = async () => {
   if (!confirm("会逐个探测所有分享，把失效和空白的链接从目录里删掉。挂载多时要等一会儿，继续？")) return;
   b3.disabled = true;
-  let from = "", removed = [], total = 0, guard = 0, done = false;
+  let from = "", removed = [], flagged = [], total = 0, guard = 0, done = false;
   try {
     while (!done) {
       if (++guard > 1000) break;
@@ -882,12 +897,13 @@ b3.onclick = async () => {
       if (!j.ok) { msg3.textContent = "失败: " + (j.error || r.status); msg3.className = "hint err"; return; }
       from = j.nextFrom; total = j.total; done = j.done;
       if (j.removed && j.removed.length) removed = removed.concat(j.removed);
+      if (j.flagged && j.flagged.length) flagged = flagged.concat(j.flagged);
       msg3.textContent = "体检中… 还剩 " + j.remaining + " 个，已清理 " + removed.length + " 项";
       msg3.className = "hint";
     }
-    msg3.textContent = removed.length
-      ? ("体检完成：共 " + total + " 个挂载，清理了 " + removed.length + " 项，稍后自动刷新")
-      : ("体检完成：共 " + total + " 个挂载，没有失效或空链接");
+    msg3.textContent = "体检完成：共 " + total + " 个挂载，清理 " + removed.length + " 项"
+      + (flagged.length ? "；另有 " + flagged.length + " 个分享返回未知错误码，已保留未删除，可在 Cloudflare 日志里查" : "")
+      + (removed.length ? "，稍后自动刷新" : "");
     msg3.className = "hint ok";
     if (removed.length) setTimeout(() => location.reload(), 2000);
   } catch (e) {
@@ -946,16 +962,22 @@ async function handleSetup(request, env, url) {
     }
     let b;
     try { b = await request.json(); } catch { return json({ error: "bad json" }, 400); }
+    const old = await getConfig(env);
     let auth = String(b.auth || "").trim().replace(/^Basic\s+/i, "");
-    if (!auth) return json({ error: "Authorization 不能为空" }, 400);
+    if (!auth) {
+      if (!configured) return json({ error: "Authorization 不能为空" }, 400);
+      // 沿用当前生效的令牌。不能只看 config 里那份: 自动续期会把新令牌写进 KV 的 auth 键,
+      // 用旧的那份等于把续期结果覆盖回去。
+      auth = String((await env.CACHE.get("auth")) || old.auth || "");
+      if (!auth) return json({ error: "Authorization 不能为空" }, 400);
+    }
     let account = String(b.account || "").trim();
     let dec = "";
     try { dec = atob(auth); } catch { return json({ error: "Authorization 不是合法 base64" }, 400); }
     const parts = dec.split(":");
     if (parts.length < 3) return json({ error: "Authorization 格式不对, 应为 pc:手机号:令牌" }, 400);
-    if (!account) account = parts[1] || "";
+    if (!account) account = parts[1] || old.account || "";
     if (!/^\d{5,15}$/.test(account)) return json({ error: "账号识别失败, 请手动填写手机号" }, 400);
-    const old = await getConfig(env);
     // 留空 = 不修改(管理页就是这么标注的); 首次配置必须填。
     // 长度只校验"新填的"密码 —— 沿用的旧密码可能是环境变量配的短密码, 不该拦
     let dav_pass = String(b.dav_pass || "");
@@ -1025,10 +1047,20 @@ async function handleCatalogLines(request, env) {
     const ids = parseLinkEntriesInWorker(link);
     if (!ids.length) continue;
     if (mounts[path]) {
-      // 同一路径写了两行: 合并 id, 而不是让后一行静默覆盖前一行(前者会被无声丢掉)
-      const have = new Set(mounts[path].id.split(",").map(s => s.split("#")[0]));
-      const add = ids.filter(i => !have.has(i.split("#")[0]));
-      if (add.length) mounts[path].id = [mounts[path].id].concat(add).join(",");
+      // 同一路径写了两行: 合并 id, 并允许后一行更新提取码
+      const currentList = mounts[path].id.split(",").filter(Boolean);
+      const idMap = new Map();
+      for (const item of currentList) {
+        const [sid] = item.split("#");
+        idMap.set(sid, item);
+      }
+      for (const item of ids) {
+        const [sid, pwd] = item.split("#");
+        if (!idMap.has(sid) || pwd) {
+          idMap.set(sid, item);
+        }
+      }
+      mounts[path].id = Array.from(idMap.values()).join(",");
       merged.push(path);
       continue;
     }
@@ -1082,8 +1114,13 @@ async function warmMounts(env, ctx) {
 // 探测一个挂载成员(现拉根目录, 不走缓存)。四种结果:
 //   ok      能列出且有内容
 //   empty   能列出但里面什么都没有
-//   dead    139 明确报错(分享被取消 / 提取码错)。要连错两次才算, 免得偶发业务错误误删
-//   unknown 风控 9530 / 网络错误 / 预算用尽这类临时问题, 一律保留, 绝不当死链删
+//   dead    139 明确报"分享不存在/被取消"。要连错两次才算, 免得偶发错误误删
+//   unknown 其他一切情况(风控 9530 / 网络错误 / 预算用尽 / 其他业务错误码), 一律保留不删
+//
+// 只认 DEAD_RC 这一个码当死链, 是照兄弟项目拿 1552 个真实分享验证过的结论:
+// 只有它确定代表"外链不存在/被分享者取消"。其他非零码可能只是临时故障或需要人工判断,
+// 误删的代价远大于漏删, 所以一律保留, 只在 flagged 里列出来给人看。
+const DEAD_RC = "200000727";
 async function probeMember(env, member, budget) {
   let last = null;
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -1093,11 +1130,24 @@ async function probeMember(env, member, budget) {
     } catch (e) {
       const rc = String(e?.rc ?? "ERR");
       const msg = String(e?.message || e).slice(0, 120);
-      if (rc === "9530" || rc === "ERR" || rc === "BUDGET") return { status: "unknown", rc, msg };
+      if (rc !== DEAD_RC) return { status: "unknown", rc, msg };
       last = { rc, msg };
     }
   }
   return { status: "dead", rc: last?.rc || "?", msg: last?.msg || "" };
+}
+
+// 直接从 KV 读 catalog, 绕过 60 秒内存缓存。体检写回前用它拿最新数据,
+// 否则会拿缓存里的旧快照把管理员刚保存的挂载覆盖掉。
+async function readCatalogFresh(env) {
+  try {
+    const kv = await env.CACHE.get("catalog");
+    if (kv) {
+      const d = JSON.parse(kv);
+      if (d && d.mounts) return d;
+    }
+  } catch {}
+  return null;
 }
 
 // 体检并清理: 从 from 指定的那个挂载开始, 处理最多 batch 个, 失效/空白的成员直接从 catalog 移除。
@@ -1107,12 +1157,12 @@ async function pruneCatalog(env, from, batch) {
   const cat = await getCatalog(env);
   const mounts = cat.mounts || {};
   const keys = Object.keys(mounts);
-  if (!keys.length) return { total: 0, remaining: 0, checked: 0, nextFrom: "", done: true, removed: [] };
+  if (!keys.length) return { total: 0, remaining: 0, checked: 0, nextFrom: "", done: true, removed: [], flagged: [] };
   let i = 0;
   if (from) { const at = keys.indexOf(from); i = at >= 0 ? at : 0; }
   const budget = (globalThis.__callCount || 0) + CHECK_CALL_BUDGET;
   const next = { ...mounts };
-  const removed = [];
+  const removed = [], flagged = [];
   let n = 0;
   while (i < keys.length && n < batch) {
     if ((globalThis.__callCount || 0) >= budget) break;   // 预算用尽, 剩下的下一轮再查
@@ -1123,28 +1173,44 @@ async function pruneCatalog(env, from, batch) {
     const kept = [], why = [];
     for (const m of members) {
       const r = await probeMember(env, m, budget);
-      if (r.status === "ok" || r.status === "unknown") kept.push(m);
-      else why.push(m.id + ": " + (r.status === "empty" ? "空分享" : (r.rc || "失效")));
+      if (r.status === "ok") kept.push(m);
+      else if (r.status === "unknown") {
+        kept.push(m);
+        // 风控/网络/预算属于常态, 不进报告; 其他业务码列出来让人自己判断
+        if (r.rc && r.rc !== "9530" && r.rc !== "ERR" && r.rc !== "BUDGET") flagged.push({ path, reason: m.id + ": " + r.rc });
+      } else why.push(m.id + ": " + (r.status === "empty" ? "空分享" : (r.rc || "失效")));
     }
-    if (!kept.length) { delete next[path]; removed.push({ path, reason: why.join("; ") || "全部失效" }); }
+    // 记下删除前的原始 id, 万一是误删还能照着加回来
+    if (!kept.length) { delete next[path]; removed.push({ path, reason: why.join("; ") || "全部失效", id: mounts[path].id }); }
     else if (kept.length < members.length) {
       next[path] = { id: kept.map(m => (m.pwd ? m.id + "#" + m.pwd : m.id)).join(",") };
-      removed.push({ path, reason: "部分成员失效: " + why.join("; ") });
+      removed.push({ path, reason: "部分成员失效: " + why.join("; "), id: mounts[path].id });
     }
   }
   const done = i >= keys.length;
   if (removed.length) {
+    // 写回前重新从 KV 读一次(绕过内存缓存), 只把我们动过的那几条应用上去,
+    // 这样体检期间管理员新保存的挂载不会被旧快照覆盖。
+    const latestCat = (await readCatalogFresh(env)) || cat;
+    const latestMounts = { ...(latestCat.mounts || {}) };
+    for (const r of removed) {
+      if (next[r.path]) {
+        if (latestMounts[r.path]) latestMounts[r.path] = next[r.path];
+      } else {
+        delete latestMounts[r.path];
+      }
+    }
     // generated 也跟着更新, 让客户端知道目录变过
     const generated = new Date(Date.now() + 8 * 3600e3).toISOString().replace(/\.\d+Z$/, "+08:00");
-    await env.CACHE.put("catalog", JSON.stringify({ ...cat, generated, mounts: next }));
+    await env.CACHE.put("catalog", JSON.stringify({ ...latestCat, generated, mounts: latestMounts }));
     globalThis.__cat = null;
     let log = [];
     try { log = JSON.parse(await env.CACHE.get("check_log")) || []; } catch {}
-    log = removed.map(r => ({ path: r.path, reason: r.reason, t: Date.now() })).concat(log).slice(0, 30);
+    log = removed.map(r => ({ path: r.path, reason: r.reason, id: r.id || "", t: Date.now() })).concat(log).slice(0, 30);
     await env.CACHE.put("check_log", JSON.stringify(log), { expirationTtl: 30 * 86400 });
   }
   // 下一轮从 keys[i] 接着查。keys[i] 这一项一定还在(只删过 i 之前的), 所以游标不会丢。
-  return { total: keys.length, remaining: keys.length - i, checked: n, nextFrom: done ? "" : keys[i], done, removed };
+  return { total: keys.length, remaining: keys.length - i, checked: n, nextFrom: done ? "" : keys[i], done, removed, flagged };
 }
 
 // 入口

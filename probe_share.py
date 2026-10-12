@@ -60,8 +60,9 @@ def decrypt_payload(text):
     cipher = AES.new(AES_KEY, AES.MODE_CBC, raw[:16])
     data = cipher.decrypt(raw[16:])
     pad = data[-1]
-    # pad 为 0 时 data[:-0] 会变成空 bytes(合法的 PKCS7 不会是 0, 这里只是防御)
-    return json.loads((data[:-pad] if pad else data).decode("utf-8", "replace"))
+    if 1 <= pad <= 16 and data[-pad:] == bytes([pad]) * pad:
+        data = data[:-pad]
+    return json.loads(data.decode("utf-8", "replace"))
 
 
 ID_RE = re.compile(
@@ -112,6 +113,11 @@ def main():
         resp = post(LIST_URL, {"getOutLinkInfoReq": {
             "account": args.account, "linkID": lid, "passwd": pwd, "pCaID": "root",
             "caSrt": 1, "coSrt": 1, "srtDr": 0, "bNum": b, "eNum": b + 199}}, args.auth)
+        # resultCode 在响应的顶层(不是 result.resultCode), 描述字段是 desc
+        rc = str(resp.get("resultCode", "")).strip()
+        if rc and rc != "0":
+            print(f"[列表接口] 139 接口返回错误 {rc}: {resp.get('desc') or '未知错误'}")
+            return 1
         data = resp.get("data") or {}
         ca = data.get("caLst") or []
         co = data.get("coLst") or []
@@ -123,7 +129,11 @@ def main():
     for f in folders[:10]:
         print(f"    [目录] {f.get('caName')}  (caID={f.get('caID')})")
     for f in files[:10]:
-        print(f"    [文件] {f.get('coName')}  {int(f.get('coSize', 0)) / 1e6:.1f}MB")
+        try:
+            sz = int(f.get('coSize', 0) or 0) / 1e6
+        except (ValueError, TypeError):
+            sz = 0.0
+        print(f"    [文件] {f.get('coName')}  {sz:.1f}MB")
     if len(folders) > 10 or len(files) > 10:
         print("    ...")
 

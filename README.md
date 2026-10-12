@@ -138,15 +138,39 @@ WebDAV 即站点根路径，只读。**读**接口使用 WebDAV 账号密码，*
 
 可选用 GitHub Actions 自动执行。**与方式 A 二选一**：两者都是整份覆盖目录，同时使用会互相覆盖。
 
-在 fork 仓库中把链接文档放入 `data/` 并 commit，然后到 **Settings → Secrets and variables → Actions** 添加：
+**Fork 一个公开仓库时，GitHub 会把里面的计划任务默认关掉**，不会自动跑。要启用：
 
-| Secret | 值 |
+1. 打开你 fork 仓库的 **Actions** 页
+2. 如果顶部提示工作流没有在这个 fork 上运行，点右边的按钮启用全部工作流
+3. 在左侧选中 **clean-and-upload**，点 **Enable workflow**
+
+然后加 Secret：进 **Settings → Secrets and variables → Actions**，点 **New repository secret**，填上 Name 和 Secret，再点 **Add secret**，一条一条加。Secret 不会跟着 fork 复制过来，必须自己重新加一遍：
+
+| Secret | 填什么 |
 |---|---|
 | `WORKER_URL` | Worker 地址 |
-| `DAV_USER` / `DAV_PASS` | WebDAV 账号密码 |
-| `ADMIN_TOKEN` | 管理口令，仅在设置过管理口令时需要 |
+| `DAV_USER` | WebDAV 用户名 |
+| `DAV_PASS` | WebDAV 密码 |
+| `ADMIN_TOKEN` | 管理口令，设过才填 |
+
+最后把链接文档放进 `data/` 并 commit。
+
+还有两点：仓库 **60 天没有任何提交**的话，GitHub 会自动停掉计划任务，需要回 Actions 页重新启用；另外 GitHub 的计划任务**不保证准时**，高负载时可能推迟几个小时。
+
+### 它做什么
 
 Actions 每天执行一次：`data/` 有改动时才清洗并推送目录树，未变化则跳过；之后无论 `data/` 是否变化，都会执行一次死链体检。如需强制同步，手动触发该 workflow 即可。
+
+体检只删除 139 明确报「外链不存在/被分享者取消」的分享，以及空白分享。其他错误码一律保留并在报告里列出，不会自动删。被删掉的条目会连同原始分享 ID 记进清理记录，需要时可以照着加回来。
+
+### 不想用怎么关
+
+不用这套的话，关掉即可，不影响已经部署的 Worker，也不影响线上目录：
+
+1. **Actions** 页 → 左侧选中 **clean-and-upload** → 点右侧的菜单 → **Disable workflow**
+2. 或者直接删掉仓库里的 `.github/workflows/clean-upload.yml`
+
+关掉之后，目录改用管理页的「检查链接」按钮手动体检。
 
 ## 常见问题
 
