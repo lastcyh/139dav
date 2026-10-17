@@ -9,7 +9,7 @@ compatibility_date = "2025-01-01"
 binding = "CACHE"
 id = "REPLACE_WITH_KV_NAMESPACE_ID"
 
-# 定时预热: 滚动补目录缓存, 让"点进文件夹"是热路径。
-# 不配这段的话 worker 里的 scheduled() 永远不会被调用。
+# 默认按访问加载, 不运行定时预热, 避免闲置时消耗请求和 KV 额度。
+# 空数组也会移除旧部署中的 Cron。需要预热时改为 ["0 * * * *"]。
 [triggers]
-crons = ["*/30 * * * *"]
+crons = []

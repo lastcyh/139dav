@@ -6,7 +6,7 @@
     python upload_catalog.py --url https://xxx.workers.dev --user admin --pass 密码
     python upload_catalog.py            # 也可用环境变量 WORKER_URL / DAV_USER / DAV_PASS
 
-账号密码就是配置向导里设置的 WebDAV 账号密码；上传成功后 Worker 立即生效。
+若设置过管理口令, 上传需要使用它。目录更新在其他节点可能有短暂延迟。
 """
 
 import argparse
@@ -34,7 +34,11 @@ def main():
     ap.add_argument("--admin-token", dest="admin_token", default=os.environ.get("ADMIN_TOKEN", ""),
                     help="管理口令（Worker 里设过才需要; 默认取环境变量 ADMIN_TOKEN，未设则用 --pass）")
     ap.add_argument("--file", default="catalog.json", help="catalog 文件路径，默认 catalog.json")
+    ap.add_argument("--source-hash", default="", help="本次源文档指纹，成功上传后保存在 Worker")
+    ap.add_argument("--if-changed", action="store_true", help="源指纹与最近成功上传相同时跳过")
     args = ap.parse_args()
+    if args.if_changed and not args.source_hash:
+        return fail("--if-changed 需要同时提供 --source-hash")
 
     url = (args.url or "").strip().rstrip("/")
     if not url:
@@ -65,9 +69,29 @@ def main():
     # 账号密码可能是中文: requests 的 auth= 元组按 latin-1 编码会直接抛 UnicodeEncodeError,
     # 而 Worker 端是支持 UTF-8 的 —— 手动 base64(utf-8) 设头, 两端行为对齐
     token = base64.b64encode(f"{args.user}:{admin_token}".encode("utf-8")).decode("ascii")
+    headers = {"Authorization": f"Basic {token}"}
+    if args.if_changed:
+        try:
+            state = requests.get(f"{url}/admin/sync-state", headers=headers, timeout=30)
+            if state.status_code == 404:
+                return fail("Worker 不支持同步状态，请先更新 Worker；明确全量上传时可去掉 --if-changed。未上传目录。")
+            if state.status_code == 401:
+                return fail("读取同步状态失败 (401)，未上传目录：请检查用户名和管理口令；旧版 Worker 的此接口也可能返回 401，请先升级 Worker 后重试。")
+            if not state.ok:
+                return fail(f"读取同步状态失败 HTTP {state.status_code}，未上传目录")
+            info = state.json()
+            if not isinstance(info, dict) or not isinstance(info.get("source_hash"), str):
+                return fail("同步状态格式不合法，未上传目录")
+            if info["source_hash"] == args.source_hash:
+                print("data/ 与最近成功上传的版本一致，跳过上传（保留管理页手工修改）。")
+                return 0
+        except (requests.RequestException, ValueError) as e:
+            return fail(f"读取同步状态失败，未上传目录: {e}")
+    if args.source_hash:
+        catalog["source_hash"] = args.source_hash
     try:
         r = requests.post(target, json=catalog,
-                          headers={"Authorization": f"Basic {token}"}, timeout=30)
+                          headers=headers, timeout=30)
     except requests.RequestException as e:
         return fail(f"请求 {target} 失败: {e}")
 
@@ -80,8 +104,8 @@ def main():
         info = r.json()
     except ValueError:
         return fail(f"上传返回了非 JSON 内容 (HTTP {r.status_code}): {r.text[:200]}")
-    if not isinstance(info, dict):
-        info = {}
+    if not isinstance(info, dict) or info.get("ok") is not True:
+        return fail("上传响应未确认成功，请检查 Worker 返回内容")
     print(f"上传成功: {info.get('mounts', len(mounts))} 个挂载 -> {target}")
     return 0
 

@@ -56,23 +56,28 @@ EMOJI_RE = re.compile(
 
 def extract_ids(line):
     """行内所有 139 分享，返回 ['分享ID'] 或 ['分享ID#提取码']（按分享 ID 去重）"""
-    out, seen = [], set()
-    for pat in URL_PATTERNS:
-        for m in pat.finditer(line):
-            sid = m.group(1)
-            if sid in seen:
-                continue
-            seen.add(sid)
-            # 提取码必须紧跟在 ID 后面（允许前置空格）。不能在整个剩余串里找 "#"：
-            # 139 链接本身含 "#"（shareweb/#/w/i/...），同一行后面的另一个链接也带 "#"，
-            # markdown 的 [链接](链接) 后半段同样是 URL
-            rest = line[m.end():].lstrip()
-            pwd = ""
-            if rest.startswith("#"):
-                cand = re.split(r"[,，;；\s)\]]", rest[1:], maxsplit=1)[0].strip()
-                if cand and len(cand) <= 32 and not re.search(r"[/:?]", cand):
-                    pwd = cand
-            out.append(f"{sid}#{pwd}" if pwd else sid)
+    out, seen = [], {}
+
+    def add(sid, pwd):
+        token = f"{sid}#{pwd}" if pwd else sid
+        if sid not in seen:
+            seen[sid] = len(out)
+            out.append(token)
+        elif pwd and "#" not in out[seen[sid]]:
+            # 同一行也允许补上提取码; 保留首次出现的位置及第一个有效提取码。
+            out[seen[sid]] = token
+
+    matches = sorted((m for pat in URL_PATTERNS for m in pat.finditer(line)), key=lambda m: m.start())
+    for m in matches:
+        sid = m.group(1)
+        # 提取码必须紧跟在 ID 后面, 不在后续文本中搜索其他链接的 "#"。
+        rest = line[m.end():].lstrip()
+        pwd = ""
+        if rest.startswith("#"):
+            cand = re.split(r"[,，;；\s)\]]", rest[1:], maxsplit=1)[0].strip()
+            if cand and len(cand) <= 32 and not re.search(r"[/:?]", cand):
+                pwd = cand
+        add(sid, pwd)
     if out:
         return out
     # 没写完整链接时，才尝试裸 ID / ID#提取码。
@@ -83,11 +88,8 @@ def extract_ids(line):
     if not toks or not all(BARE_TOKEN_RE.match(t) for t in toks):
         return out
     for t in toks:
-        sid = t.split("#")[0]
-        if sid in seen:
-            continue
-        seen.add(sid)
-        out.append(t)
+        sid, _, pwd = t.partition("#")
+        add(sid, pwd)
     return out
 
 
@@ -125,7 +127,7 @@ def iter_lines(path):
         with open(path, "rb") as f:
             raw = f.read()
         try:
-            text = raw.decode("utf-8")
+            text = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             # 网上扒下来的老文档常见 GBK/GB18030, 别直接崩
             text = raw.decode("gb18030", errors="replace")

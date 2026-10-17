@@ -5,6 +5,13 @@ on:
     - cron: "20 2 * * *" # UTC 2:20 = 北京 10:20, 每天跑一次
   workflow_dispatch: {} # 手动触发（会强制同步一次）
 
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-upload-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   clean:
     runs-on: ubuntu-latest
@@ -24,39 +31,28 @@ jobs:
       - name: 安装依赖
         run: pip install -r requirements.txt
 
-      # ---- 目录同步：只有 data/ 真的变了才推 ----
-      # 否则你在 /admin 手动加的挂载, 会被这里每天拿 data/ 的内容整份覆盖回去。
-      - name: 计算 data/ 指纹
-        id: datahash
-        run: echo "hash=${{ hashFiles('data/**') }}" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/cache@v4
-        id: datacache
-        with:
-          path: .data-sync-marker
-          key: data-sync-${{ steps.datahash.outputs.hash }}
-
+      # Worker 中的指纹只随成功上传更新, 回退旧版本也能正确同步。
       - name: 清洗 data/ 下的链接文档
-        if: steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
+        if: env.WORKER_URL != ''
         run: python clean_links.py
 
       # data/ 里没有有效链接时 clean_links.py 不会生成 catalog.json，
       # 这里跳过上传，避免拿空目录 / 示例数据覆盖线上真实目录
       - name: 上传 catalog 到 Worker
-        if: env.WORKER_URL != '' && (steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') && hashFiles('catalog.json') != ''
-        run: python upload_catalog.py
-
-      - name: 记录本次 data/ 指纹
-        if: steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch'
-        run: echo "${{ steps.datahash.outputs.hash }}" > .data-sync-marker
+        if: env.WORKER_URL != '' && hashFiles('catalog.json') != ''
+        env:
+          DATA_HASH: ${{ hashFiles('data/**', 'clean_links.py') }}
+          FORCE_SYNC: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$FORCE_SYNC" = "true" ]; then
+            python upload_catalog.py --source-hash "$DATA_HASH"
+          else
+            python upload_catalog.py --source-hash "$DATA_HASH" --if-changed
+          fi
 
       - name: 提示（data/ 无有效链接）
-        if: (steps.datacache.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch') && hashFiles('catalog.json') == ''
+        if: env.WORKER_URL != '' && hashFiles('catalog.json') == ''
         run: echo "::warning::data/ 里没有有效分享链接，已跳过上传（线上目录未改动）。要批量导入请把链接文档放进 data/"
-
-      - name: 提示（data/ 无变化）
-        if: steps.datacache.outputs.cache-hit == 'true' && github.event_name != 'workflow_dispatch'
-        run: echo "data/ 自上次同步后没有变化，已跳过上传（你在 /admin 手动改的目录不会被覆盖）。要强制同步请手动触发本 workflow。"
 
       # ---- 死链体检：每天一轮，跟 data/ 有没有变无关 ----
       # 没配 Worker 地址就跳过，免得没配置的 fork 每天报红

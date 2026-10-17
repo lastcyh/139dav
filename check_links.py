@@ -14,6 +14,7 @@ import argparse
 import base64
 import os
 import sys
+import time
 
 import requests
 
@@ -51,7 +52,8 @@ def main():
     token = base64.b64encode(f"{args.user}:{admin_token}".encode("utf-8")).decode("ascii")
     headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
 
-    frm, removed, flagged, total = "", [], [], 0
+    frm, removed, flagged, total, unverified = "", [], [], 0, 0
+    log_warning = False
     for _ in range(args.max_rounds):
         try:
             r = requests.post(target, json={"from": frm}, headers=headers, timeout=60)
@@ -66,10 +68,18 @@ def main():
             j = r.json()
         except ValueError:
             return fail(f"返回了非 JSON 内容 (HTTP {r.status_code}): {r.text[:200]}")
-        if not j.get("ok"):
+        if not isinstance(j, dict):
+            return fail("体检响应不是 JSON 对象，尚未完成")
+        if j.get("ok") is not True:
             return fail(f"体检失败: {j.get('error') or r.status_code}")
+        if not isinstance(j.get("done"), bool):
+            return fail("体检响应缺少完成状态，尚未完成")
 
         total = j.get("total", 0)
+        log_warning = log_warning or j.get("logWarning") is True
+        uncertain = j.get("unverified", 0)
+        if isinstance(uncertain, int) and uncertain > 0:
+            unverified += uncertain
         rem = j.get("removed")
         if isinstance(rem, list):
             removed += rem
@@ -77,16 +87,25 @@ def main():
         if isinstance(flg, list):
             flagged += flg
         frm = j.get("nextFrom") or ""
-        if j.get("done") or not frm:
+        if j["done"]:
             break
+        if not isinstance(frm, str) or not frm:
+            return fail("体检响应缺少续查游标，尚未完成")
+        if isinstance(rem, list) and rem:
+            # 清理会写同一个 catalog/check_log 键, 两批之间避开 KV 的每秒写入限制。
+            time.sleep(1.1)
     else:
         return fail(f"体检轮次超过上限 {args.max_rounds}, 可能哪里不对")
 
     print(f"体检完成：共 {total} 个挂载，清理 {len(removed)} 项")
+    if log_warning:
+        print("部分清理记录未保存，目录清理已生效；请保留下面的原分享ID及原始链接文档。")
+    if unverified:
+        print(f"本轮有 {unverified} 条分享未能确认，已保留，可稍后重试。")
     for x in removed:
         print(f"  - {x.get('path')}  {x.get('reason') or ''}  原分享ID: {x.get('id') or '-'}")
     if flagged:
-        print(f"\n另有 {len(flagged)} 个分享返回了未知错误码，已保留未删除，请自行判断：")
+        print(f"\n另有 {len(flagged)} 条分享需人工核对，已保留未删除：")
         for x in flagged:
             print(f"  - {x.get('path')}  {x.get('reason') or ''}")
     return 0
